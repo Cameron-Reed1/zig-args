@@ -3,10 +3,17 @@ const Io = std.Io;
 
 const args = @import("args");
 
-pub const Args = struct {
-    first: []const u8,
-    second: bool,
-    third: ?u8,
+pub const Arguments = union(enum) {
+    cmd1: struct {
+        value: ?[]const u8,
+    },
+    cmd2: struct {
+        value: u8,
+    },
+    cmd3: struct {
+        value: bool,
+        value2: ?f32,
+    },
 };
 
 pub fn main(init: std.process.Init) !void {
