@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 
 
 const Arguments: type = root.Arguments;
+const GlobalArguments: type = if (@hasDecl(root, "GlobalArguments")) root.GlobalArguments else void;
 
 
 const ParseError = error {
@@ -13,6 +14,7 @@ const ParseError = error {
     MissingSubCommand,
     InvalidSubCommand,
     InvalidValue,
+    UnknownArgument,
     UnexpectedValue,
     DuplicateArgument,
 };
@@ -23,29 +25,50 @@ const Options = struct {
 };
 
 
-pub fn parse(gpa: Allocator, args: std.process.Args, options: Options) !Arguments {
+pub fn parse(gpa: Allocator, args: std.process.Args, options: Options) !struct { Arguments, GlobalArguments } {
     var iter = try args.iterateAllocator(gpa);
     defer iter.deinit();
 
     _ = iter.next(); // Skip program name
 
-    return switch (@typeInfo(Arguments)) {
-        .@"union" => parseSubCommand(Arguments, &iter, options),
-        .@"struct" => parseFlags(Arguments, &iter, options),
+    var global_args: OptionalStruct(GlobalArguments) = if (GlobalArguments == void) {} else .{};
+    const parsed: Arguments = switch (@typeInfo(Arguments)) {
+        .@"union" => try parseSubCommand(Arguments, &iter, &global_args, options),
+        .@"struct" => try parseFlags(Arguments, &iter, &global_args, options),
         else => unreachable,
+    };
+
+    while (iter.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
+
+        if (try parseGlobalArgument(&global_args, arg, &iter, options)) continue;
+
+        return ParseError.UnknownArgument;
+    }
+
+    return .{
+        parsed,
+        if (GlobalArguments == void) {} else try finalize(GlobalArguments, global_args)
     };
 }
 
-pub fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, options: Options) !T {
-    const cmd = iter.next() orelse return ParseError.MissingSubCommand;
+fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!T {
+    const cmd = blk: {
+        while (iter.next()) |arg| {
+            if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
+            break :blk arg;
+        }
+
+        return ParseError.MissingSubCommand;
+    };
 
     const union_info = @typeInfo(T).@"union";
     inline for(union_info.field_names, union_info.field_types) |cmd_name, cmd_type| {
         if (std.mem.eql(u8, cmd_name, cmd)) {
             return switch (@typeInfo(cmd_type)) {
                 .void => @unionInit(T, cmd_name, {}),
-                .@"struct" => @unionInit(T, cmd_name, try parseFlags(cmd_type, iter, options)),
-                .@"union" => @unionInit(T, cmd_name, try parseSubCommand(cmd_type, iter, options)),
+                .@"struct" => @unionInit(T, cmd_name, try parseFlags(cmd_type, iter, global_args, options)),
+                .@"union" => @unionInit(T, cmd_name, try parseSubCommand(cmd_type, iter, global_args, options)),
                 else => unreachable,
             };
         }
@@ -54,13 +77,12 @@ pub fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, options: Optio
     return ParseError.InvalidSubCommand;
 }
 
-pub fn parseFlags(T: type, iter: *std.process.Args.Iterator, options: Options) !T {
+fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!T {
     var partial: OptionalStruct(T) = .{};
 
-    while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--")) {
-            return ParseError.UnexpectedValue;
-        }
+    outer: while (iter.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
+        if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
 
         const struct_info = @typeInfo(@TypeOf(partial)).@"struct";
         inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
@@ -75,14 +97,43 @@ pub fn parseFlags(T: type, iter: *std.process.Args.Iterator, options: Options) !
                     const val = iter.next() orelse return ParseError.MissingArgumentValue;
                     @field(partial, field_name) = try parseValue(@typeInfo(field_type).optional.child, val);
                 }
+
+                continue :outer;
             }
         }
+
+        return ParseError.UnknownArgument;
     }
 
     return finalize(T, partial);
 }
 
-fn parseValue(T: type, str: [:0]const u8) !T {
+fn parseGlobalArgument(global_args: *OptionalStruct(GlobalArguments), arg: []const u8, iter: *std.process.Args.Iterator, options: Options) !bool {
+    if (GlobalArguments == void) return false;
+    if (!std.mem.startsWith(u8, arg, "--")) return false;
+
+    const struct_info = @typeInfo(OptionalStruct(GlobalArguments)).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+        if (std.mem.eql(u8, field_name, arg[2..])) {
+            if (field_type == bool) {
+                if (@field(global_args, field_name) and !options.allow_repeats) return ParseError.DuplicateArgument;
+
+                @field(global_args, field_name) = true;
+            } else {
+                if (@field(global_args, field_name) != null and !options.allow_repeats) return ParseError.DuplicateArgument;
+
+                const val = iter.next() orelse return ParseError.MissingArgumentValue;
+                @field(global_args, field_name) = try parseValue(@typeInfo(field_type).optional.child, val);
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn parseValue(T: type, str: [:0]const u8) ParseError!T {
     const type_info = @typeInfo(T);
 
     return switch (type_info) {
@@ -121,6 +172,8 @@ fn finalize(T: type, partial: OptionalStruct(T)) ParseError!T {
 }
 
 fn OptionalStruct(T: type) type {
+    if (T == void) return void;
+
     const struct_info = @typeInfo(T).@"struct";
 
     comptime var field_types: [struct_info.field_types.len]type = undefined;

@@ -23,7 +23,12 @@ pub const Arguments = union(enum) {
     }
 };
 
+pub const GlobalArguments = struct {
+    global: ?[]const u8,
+};
+
 pub fn main(init: std.process.Init) !void {
-    const parsed_args = try args.parse(init.gpa, init.minimal.args, .{});
+    const parsed_args, const global_args = try args.parse(init.gpa, init.minimal.args, .{});
     std.debug.print("{any}\n", .{parsed_args});
+    std.debug.print("{any}\n", .{global_args});
 }
