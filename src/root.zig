@@ -24,51 +24,63 @@ const Options = struct {
     allow_repeats: bool = false,
 };
 
+var arg0: ?[]const u8 = null;
+var print_help: bool = false;
+
 
 pub fn parse(gpa: Allocator, args: std.process.Args, options: Options) !struct { Arguments, GlobalArguments } {
     var iter = try args.iterateAllocator(gpa);
     defer iter.deinit();
 
-    _ = iter.next(); // Skip program name
+    arg0 = iter.next() orelse unreachable;
 
     var global_args: OptionalStruct(GlobalArguments) = if (GlobalArguments == void) {} else .{};
-    const parsed: Arguments = switch (@typeInfo(Arguments)) {
+    const parsed: Optional(Arguments) = switch (@typeInfo(Arguments)) {
+        .optional,
         .@"union" => try parseSubCommand(Arguments, &iter, &global_args, options),
         .@"struct" => try parseFlags(Arguments, &iter, &global_args, options),
         else => unreachable,
     };
 
     while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
-
         if (try parseGlobalArgument(&global_args, arg, &iter, options)) continue;
 
+        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
         return ParseError.UnknownArgument;
     }
 
+    if (print_help) try printHelp(gpa, parsed);
+
     return .{
-        parsed,
+        try finalize(Arguments, parsed),
         if (GlobalArguments == void) {} else try finalize(GlobalArguments, global_args)
     };
 }
 
-fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!T {
+fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!Optional(T) {
     const cmd = blk: {
         while (iter.next()) |arg| {
             if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
             break :blk arg;
         }
 
-        return ParseError.MissingSubCommand;
+        return null;
     };
 
-    const union_info = @typeInfo(T).@"union";
+    const union_info = switch (@typeInfo(T)) {
+        .@"union" => |info| info,
+        .optional => |info| @typeInfo(info.child).@"union",
+        else => unreachable,
+    };
     inline for(union_info.field_names, union_info.field_types) |cmd_name, cmd_type| {
         if (std.mem.eql(u8, cmd_name, cmd)) {
+            const union_type = @typeInfo(Optional(T)).optional.child;
+
             return switch (@typeInfo(cmd_type)) {
-                .void => @unionInit(T, cmd_name, {}),
-                .@"struct" => @unionInit(T, cmd_name, try parseFlags(cmd_type, iter, global_args, options)),
-                .@"union" => @unionInit(T, cmd_name, try parseSubCommand(cmd_type, iter, global_args, options)),
+                .void => @unionInit(union_type, cmd_name, {}),
+                .@"struct" => @unionInit(union_type, cmd_name, try parseFlags(cmd_type, iter, global_args, options)),
+                .@"union",
+                .optional => @unionInit(union_type, cmd_name, try parseSubCommand(cmd_type, iter, global_args, options)),
                 else => unreachable,
             };
         }
@@ -77,12 +89,12 @@ fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *Opti
     return ParseError.InvalidSubCommand;
 }
 
-fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!T {
+fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!Optional(T) {
     var partial: OptionalStruct(T) = .{};
 
     outer: while (iter.next()) |arg| {
-        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
         if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
+        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
 
         const struct_info = @typeInfo(@TypeOf(partial)).@"struct";
         inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
@@ -105,10 +117,11 @@ fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalS
         return ParseError.UnknownArgument;
     }
 
-    return finalize(T, partial);
+    return partial;
 }
 
 fn parseGlobalArgument(global_args: *OptionalStruct(GlobalArguments), arg: []const u8, iter: *std.process.Args.Iterator, options: Options) !bool {
+    if (try checkHelp(arg, options)) return true;
     if (GlobalArguments == void) return false;
     if (!std.mem.startsWith(u8, arg, "--")) return false;
 
@@ -153,7 +166,17 @@ fn parseValue(T: type, str: [:0]const u8) ParseError!T {
     };
 }
 
-fn finalize(T: type, partial: OptionalStruct(T)) ParseError!T {
+fn finalize(T: type, partial: Optional(T)) ParseError!T {
+    return switch (@typeInfo(T)) {
+        .@"struct" => finalizeStruct(T, partial),
+        .@"union",
+        .optional => finalizeUnion(T, partial),
+        .void => {},
+        else => unreachable,
+    };
+}
+
+fn finalizeStruct(T: type, partial: OptionalStruct(T)) ParseError!T {
     var finalized: T = undefined;
 
     const type_info = @typeInfo(T).@"struct";
@@ -171,25 +194,150 @@ fn finalize(T: type, partial: OptionalStruct(T)) ParseError!T {
     return finalized;
 }
 
-fn OptionalStruct(T: type) type {
-    if (T == void) return void;
+fn finalizeUnion(T: type, partial: Optional(T)) ParseError!T {
+    const type_info = @typeInfo(T);
+    if (partial == null) {
+        if (type_info != .optional) return ParseError.MissingSubCommand;
+        return null;
+    }
+
+    const finalized_type = if (type_info == .optional) type_info.optional.child else T;
+
+    return switch (partial.?) {
+        inline else => |v, tag| @unionInit(finalized_type, @tagName(tag), try finalize(@FieldType(finalized_type, @tagName(tag)), v)),
+    };
+}
+
+fn checkHelp(arg: []const u8, options: Options) !bool {
+    if (std.mem.eql(u8, "--help", arg)) {
+        if (print_help and !options.allow_repeats) return ParseError.DuplicateArgument;
+        print_help = true;
+        return true;
+    }
+
+    return false;
+}
+
+fn printHelp(gpa: Allocator, parsed: Optional(Arguments)) !void {
+    std.debug.assert(arg0 != null);
+
+    var parsed_commands: std.ArrayList(u8) = .empty;
+    defer parsed_commands.deinit(gpa);
+
+    const help_options = try chooseHelpMsg(gpa, &parsed_commands, parsed);
+
+    comptime var help_str: []const u8 = "Usage: {s}{s} [OPTIONS]\n\n{s}";
+
+    if (GlobalArguments != void) {
+        help_str = help_str ++ "Global Options:\n" ++ comptime buildStructHelp(GlobalArguments);
+    }
+
+    std.debug.print(help_str, .{arg0.?, parsed_commands.items, help_options});
+    std.process.exit(0);
+}
+
+fn chooseHelpMsg(gpa: Allocator, cmds: *std.ArrayList(u8), value: anytype) ![]const u8 {
+    const T = @TypeOf(value);
+
+    switch (@typeInfo(T)) {
+        .@"union" => {
+            const cmd = @tagName(value);
+
+            try cmds.append(gpa, ' ');
+            try cmds.appendSlice(gpa, cmd);
+
+            switch (value) {
+                inline else => |v| return try chooseHelpMsg(gpa, cmds, v),
+            }
+        },
+        .optional => {
+            if (value) |v| {
+                return try chooseHelpMsg(gpa, cmds, v);
+            } else {
+                return "Commands:\n" ++ comptime buildUnionHelp(T) ++ "\n";
+            }
+        },
+        .@"struct" => return "Options:\n" ++ comptime buildStructHelp(T) ++ "\n",
+        .void => return "",
+        else => unreachable,
+    }
+}
+
+fn buildStructHelp(T: type) []const u8 {
+    comptime var help_str: []const u8 = "";
 
     const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names) |field_name| {
+        help_str = help_str ++ "\t--" ++ field_name ++ "\n";
+    }
 
+    return help_str;
+}
+
+fn buildUnionHelp(T: type) []const u8 {
+    const type_info = @typeInfo(T);
+    if (type_info == .optional) return buildUnionHelp(type_info.optional.child);
+
+    comptime var help_str: []const u8 = "";
+
+    const union_info = type_info.@"union";
+    inline for (union_info.field_names) |field_name| {
+        help_str = help_str ++ "\t" ++ field_name ++ "\n";
+    }
+
+    return help_str;
+}
+
+fn Optional(T: type) type {
+    return switch (@typeInfo(T)) {
+        .@"struct" => OptionalStruct(T),
+        .@"union" => OptionalUnion(T),
+        .void => void,
+        .optional => |opt_info| switch (@typeInfo(opt_info.child)) {
+            .@"union" => OptionalUnion(opt_info.child),
+            else => unreachable,
+        },
+        else => unreachable,
+    };
+}
+
+fn OptionalStruct(T: type) type {
+    const struct_info = @typeInfo(T).@"struct";
+
+    const field_names = struct_info.field_names;
     comptime var field_types: [struct_info.field_types.len]type = undefined;
     comptime var field_attrs: [struct_info.field_types.len]std.builtin.Type.Struct.FieldAttributes = @splat(.{});
-    for (&field_types, &field_attrs, struct_info.field_types) |*ftype, *attr, original| {
+    for (struct_info.field_types, 0..) |original, i| {
+        if (std.mem.eql(u8, "help", field_names[i])) @compileError("--help is reserved");
+
         checkFieldType(original);
         if (original == bool) {
-            ftype.* = bool;
-            attr.default_value_ptr = &false;
+            field_types[i] = bool;
+            field_attrs[i].default_value_ptr = &false;
         } else {
-            ftype.* = if (@typeInfo(original) == .optional) original else ?original;
-            attr.default_value_ptr = &@as(ftype.*, null);
+            field_types[i] = if (@typeInfo(original) == .optional) original else ?original;
+            field_attrs[i].default_value_ptr = &@as(field_types[i], null);
         }
     }
 
-    return @Struct(.auto, null, struct_info.field_names, &field_types, &field_attrs);
+    return @Struct(.auto, null, field_names, &field_types, &field_attrs);
+}
+
+fn OptionalUnion(T: type) type {
+    const union_info = @typeInfo(T).@"union";
+
+    comptime var field_types: [union_info.field_types.len]type = undefined;
+    inline for (&field_types, union_info.field_types) |*ftype, original| {
+        ftype.* = switch (@typeInfo(original)) {
+            .optional,
+            .@"struct",
+            .@"union",
+            .void => Optional(original),
+            else => unreachable,
+        };
+    }
+
+    return ?@Union(.auto, union_info.tag_type, union_info.field_names, &field_types, &@splat(.{}));
 }
 
 fn checkFieldType(T: type) void {

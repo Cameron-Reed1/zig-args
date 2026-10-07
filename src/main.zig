@@ -15,7 +15,7 @@ pub const Arguments = union(enum) {
         value2: ?f32,
     },
     cmd4: void,
-    cmd5: union(enum) {
+    cmd5: ?union(enum) {
         cmd51: void,
         cmd52: struct {
             value: u32,
