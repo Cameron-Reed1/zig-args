@@ -3,14 +3,12 @@ const root = @import("root");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-
 const has_global = @hasDecl(root, "GlobalArguments");
 
 const Arguments: type = root.Arguments;
 const GlobalArguments: type = if (has_global) root.GlobalArguments else void;
 
-
-const ParseError = error {
+const ParseError = error{
     MissingRequiredArgument,
     MissingArgumentValue,
     MissingSubCommand,
@@ -21,7 +19,6 @@ const ParseError = error {
     DuplicateArgument,
 } || Allocator.Error;
 
-
 const Options = struct {
     allow_repeats: bool = false,
     collect_extra_values: bool = false,
@@ -29,7 +26,6 @@ const Options = struct {
 
 var arg0: ?[]const u8 = null;
 var print_help: bool = false;
-
 
 fn Result(comptime options: Options) type {
     comptime var len = 1;
@@ -54,7 +50,6 @@ fn ExtraValues(comptime options: Options) type {
     return if (options.collect_extra_values) std.ArrayList([]const u8) else void;
 }
 
-
 pub fn parse(gpa: Allocator, arena: Allocator, args: std.process.Args, comptime options: Options) !Result(options) {
     var iter = try args.iterateAllocator(gpa);
     defer iter.deinit();
@@ -66,8 +61,7 @@ pub fn parse(gpa: Allocator, arena: Allocator, args: std.process.Args, comptime 
 
     var global_args: OptionalStruct(GlobalArguments) = if (has_global) .{} else {};
     const parsed: Optional(Arguments) = switch (@typeInfo(Arguments)) {
-        .optional,
-        .@"union" => try parseSubCommand(arena, Arguments, &iter, options, &global_args, &extra_values),
+        .optional, .@"union" => try parseSubCommand(arena, Arguments, &iter, options, &global_args, &extra_values),
         .@"struct" => try parseFlags(arena, Arguments, &iter, options, &global_args, &extra_values),
         else => unreachable,
     };
@@ -86,7 +80,6 @@ pub fn parse(gpa: Allocator, arena: Allocator, args: std.process.Args, comptime 
     }
 
     if (print_help) try printHelp(gpa, parsed);
-
 
     var result: Result(options) = undefined;
     result[0] = try finalize(Arguments, parsed);
@@ -120,15 +113,14 @@ fn parseSubCommand(arena: Allocator, T: type, iter: *std.process.Args.Iterator, 
         .optional => |info| @typeInfo(info.child).@"union",
         else => unreachable,
     };
-    inline for(union_info.field_names, union_info.field_types) |cmd_name, cmd_type| {
+    inline for (union_info.field_names, union_info.field_types) |cmd_name, cmd_type| {
         if (std.mem.eql(u8, cmd_name, cmd)) {
             const union_type = @typeInfo(Optional(T)).optional.child;
 
             return switch (@typeInfo(cmd_type)) {
                 .void => @unionInit(union_type, cmd_name, {}),
                 .@"struct" => @unionInit(union_type, cmd_name, try parseFlags(arena, cmd_type, iter, options, global_args, extra_values)),
-                .@"union",
-                .optional => @unionInit(union_type, cmd_name, try parseSubCommand(arena, cmd_type, iter, options, global_args, extra_values)),
+                .@"union", .optional => @unionInit(union_type, cmd_name, try parseSubCommand(arena, cmd_type, iter, options, global_args, extra_values)),
                 else => unreachable,
             };
         }
@@ -212,7 +204,7 @@ fn parseValue(arena: Allocator, T: type, str: [:0]const u8) ParseError!T {
         .@"enum" => |enum_info| blk: {
             for (enum_info.fields) |enum_field| {
                 if (std.mem.eql(u8, enum_field.name, str)) {
-                    break :blk @enumFromInt(enum_field.value);
+                    break :blk @fromBackingInt(@intCast(enum_field.value));
                 }
             }
 
@@ -225,8 +217,7 @@ fn parseValue(arena: Allocator, T: type, str: [:0]const u8) ParseError!T {
 fn finalize(T: type, partial: Optional(T)) ParseError!T {
     return switch (@typeInfo(T)) {
         .@"struct" => finalizeStruct(T, partial),
-        .@"union",
-        .optional => finalizeUnion(T, partial),
+        .@"union", .optional => finalizeUnion(T, partial),
         .void => {},
         else => unreachable,
     };
@@ -288,7 +279,7 @@ fn printHelp(gpa: Allocator, parsed: Optional(Arguments)) !void {
         help_str = help_str ++ "Global Options:\n" ++ comptime buildStructHelp(GlobalArguments);
     }
 
-    std.debug.print(help_str, .{arg0.?, parsed_commands.items, help_options});
+    std.debug.print(help_str, .{ arg0.?, parsed_commands.items, help_options });
     std.process.exit(0);
 }
 
@@ -385,10 +376,7 @@ fn OptionalUnion(T: type) type {
     comptime var field_types: [union_info.field_types.len]type = undefined;
     inline for (&field_types, union_info.field_types) |*ftype, original| {
         ftype.* = switch (@typeInfo(original)) {
-            .optional,
-            .@"struct",
-            .@"union",
-            .void => Optional(original),
+            .optional, .@"struct", .@"union", .void => Optional(original),
             else => unreachable,
         };
     }
@@ -398,10 +386,7 @@ fn OptionalUnion(T: type) type {
 
 fn checkFieldType(T: type) void {
     switch (@typeInfo(T)) {
-        .int,
-        .bool,
-        .float,
-        .@"enum" => return,
+        .int, .bool, .float, .@"enum" => return,
         .pointer => |ptr_info| if (ptr_info.size == .slice and ptr_info.child == u8) return,
         .optional => |opt_info| return checkFieldType(opt_info.child),
         else => {},
