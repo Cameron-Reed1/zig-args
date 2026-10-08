@@ -29,6 +29,7 @@ expect_failure ./zig-out/bin/args cmd2 --value -1
 expect_success ./zig-out/bin/args cmd3
 expect_success ./zig-out/bin/args cmd3 --value
 expect_success ./zig-out/bin/args cmd4
+expect_success ./zig-out/bin/args cmd4 hello
 expect_success ./zig-out/bin/args cmd5
 expect_success ./zig-out/bin/args cmd5 cmd51
 expect_failure ./zig-out/bin/args cmd5 cmd52
@@ -37,3 +38,4 @@ expect_success ./zig-out/bin/args --global 1 cmd5 cmd52 --value 30000
 expect_success ./zig-out/bin/args cmd5 --global 1 cmd52 --value 30000
 expect_success ./zig-out/bin/args cmd5 cmd52 --global 1 --value 30000
 expect_success ./zig-out/bin/args cmd5 cmd52 --value 30000 --global 1
+expect_success ./zig-out/bin/args cmd5 cmd52 hello --value 30000 --global 1 world

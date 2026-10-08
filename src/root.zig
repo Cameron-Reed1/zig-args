@@ -4,8 +4,10 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 
+const has_global = @hasDecl(root, "GlobalArguments");
+
 const Arguments: type = root.Arguments;
-const GlobalArguments: type = if (@hasDecl(root, "GlobalArguments")) root.GlobalArguments else void;
+const GlobalArguments: type = if (has_global) root.GlobalArguments else void;
 
 
 const ParseError = error {
@@ -17,50 +19,96 @@ const ParseError = error {
     UnknownArgument,
     UnexpectedValue,
     DuplicateArgument,
-};
+} || Allocator.Error;
 
 
 const Options = struct {
     allow_repeats: bool = false,
+    collect_extra_values: bool = false,
 };
 
 var arg0: ?[]const u8 = null;
 var print_help: bool = false;
 
 
-pub fn parse(gpa: Allocator, args: std.process.Args, options: Options) !struct { Arguments, GlobalArguments } {
+fn Result(comptime options: Options) type {
+    comptime var len = 1;
+    if (has_global) len += 1;
+    if (options.collect_extra_values) len += 1;
+
+    comptime var field_types: [len]type = undefined;
+    field_types[0] = Arguments;
+
+    if (has_global) {
+        field_types[1] = GlobalArguments;
+    }
+
+    if (options.collect_extra_values) {
+        field_types[len - 1] = []const []const u8;
+    }
+
+    return @Tuple(&field_types);
+}
+
+fn ExtraValues(comptime options: Options) type {
+    return if (options.collect_extra_values) std.ArrayList([]const u8) else void;
+}
+
+
+pub fn parse(gpa: Allocator, arena: Allocator, args: std.process.Args, comptime options: Options) !Result(options) {
     var iter = try args.iterateAllocator(gpa);
     defer iter.deinit();
 
     arg0 = iter.next() orelse unreachable;
 
-    var global_args: OptionalStruct(GlobalArguments) = if (GlobalArguments == void) {} else .{};
+    var extra_values: ExtraValues(options) = if (options.collect_extra_values) .empty else {};
+    defer if (options.collect_extra_values) extra_values.deinit(arena);
+
+    var global_args: OptionalStruct(GlobalArguments) = if (has_global) .{} else {};
     const parsed: Optional(Arguments) = switch (@typeInfo(Arguments)) {
         .optional,
-        .@"union" => try parseSubCommand(Arguments, &iter, &global_args, options),
-        .@"struct" => try parseFlags(Arguments, &iter, &global_args, options),
+        .@"union" => try parseSubCommand(arena, Arguments, &iter, options, &global_args, &extra_values),
+        .@"struct" => try parseFlags(arena, Arguments, &iter, options, &global_args, &extra_values),
         else => unreachable,
     };
 
     while (iter.next()) |arg| {
-        if (try parseGlobalArgument(&global_args, arg, &iter, options)) continue;
+        if (try parseGlobalArgument(arena, &global_args, arg, &iter, options)) continue;
 
-        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
-        return ParseError.UnknownArgument;
+        if (std.mem.startsWith(u8, arg, "--")) return ParseError.UnknownArgument;
+
+        if (options.collect_extra_values) {
+            const duped = try arena.dupe(u8, arg);
+            try extra_values.append(arena, duped);
+        } else {
+            return ParseError.UnexpectedValue;
+        }
     }
 
     if (print_help) try printHelp(gpa, parsed);
 
-    return .{
-        try finalize(Arguments, parsed),
-        if (GlobalArguments == void) {} else try finalize(GlobalArguments, global_args)
-    };
+
+    var result: Result(options) = undefined;
+    result[0] = try finalize(Arguments, parsed);
+    comptime var i: usize = 1;
+
+    if (has_global) {
+        result[i] = try finalize(GlobalArguments, global_args);
+        i += 1;
+    }
+
+    if (options.collect_extra_values) {
+        result[i] = try extra_values.toOwnedSlice(arena);
+        i += 1;
+    }
+
+    return result;
 }
 
-fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!Optional(T) {
+fn parseSubCommand(arena: Allocator, T: type, iter: *std.process.Args.Iterator, comptime options: Options, global_args: *OptionalStruct(GlobalArguments), extra_values: *ExtraValues(options)) ParseError!Optional(T) {
     const cmd = blk: {
         while (iter.next()) |arg| {
-            if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
+            if (try parseGlobalArgument(arena, global_args, arg, iter, options)) continue;
             break :blk arg;
         }
 
@@ -78,9 +126,9 @@ fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *Opti
 
             return switch (@typeInfo(cmd_type)) {
                 .void => @unionInit(union_type, cmd_name, {}),
-                .@"struct" => @unionInit(union_type, cmd_name, try parseFlags(cmd_type, iter, global_args, options)),
+                .@"struct" => @unionInit(union_type, cmd_name, try parseFlags(arena, cmd_type, iter, options, global_args, extra_values)),
                 .@"union",
-                .optional => @unionInit(union_type, cmd_name, try parseSubCommand(cmd_type, iter, global_args, options)),
+                .optional => @unionInit(union_type, cmd_name, try parseSubCommand(arena, cmd_type, iter, options, global_args, extra_values)),
                 else => unreachable,
             };
         }
@@ -89,12 +137,20 @@ fn parseSubCommand(T: type, iter: *std.process.Args.Iterator, global_args: *Opti
     return ParseError.InvalidSubCommand;
 }
 
-fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalStruct(GlobalArguments), options: Options) ParseError!Optional(T) {
+fn parseFlags(arena: Allocator, T: type, iter: *std.process.Args.Iterator, comptime options: Options, global_args: *OptionalStruct(GlobalArguments), extra_values: *ExtraValues(options)) ParseError!Optional(T) {
     var partial: OptionalStruct(T) = .{};
 
     outer: while (iter.next()) |arg| {
-        if (try parseGlobalArgument(global_args, arg, iter, options)) continue;
-        if (!std.mem.startsWith(u8, arg, "--")) return ParseError.UnexpectedValue;
+        if (try parseGlobalArgument(arena, global_args, arg, iter, options)) continue;
+        if (!std.mem.startsWith(u8, arg, "--")) {
+            if (options.collect_extra_values) {
+                const duped = try arena.dupe(u8, arg);
+                try extra_values.append(arena, duped);
+                continue;
+            } else {
+                return ParseError.UnexpectedValue;
+            }
+        }
 
         const struct_info = @typeInfo(@TypeOf(partial)).@"struct";
         inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
@@ -107,7 +163,7 @@ fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalS
                     if (@field(partial, field_name) != null and !options.allow_repeats) return ParseError.DuplicateArgument;
 
                     const val = iter.next() orelse return ParseError.MissingArgumentValue;
-                    @field(partial, field_name) = try parseValue(@typeInfo(field_type).optional.child, val);
+                    @field(partial, field_name) = try parseValue(arena, @typeInfo(field_type).optional.child, val);
                 }
 
                 continue :outer;
@@ -120,9 +176,9 @@ fn parseFlags(T: type, iter: *std.process.Args.Iterator, global_args: *OptionalS
     return partial;
 }
 
-fn parseGlobalArgument(global_args: *OptionalStruct(GlobalArguments), arg: []const u8, iter: *std.process.Args.Iterator, options: Options) !bool {
+fn parseGlobalArgument(arena: Allocator, global_args: *OptionalStruct(GlobalArguments), arg: []const u8, iter: *std.process.Args.Iterator, options: Options) !bool {
     if (try checkHelp(arg, options)) return true;
-    if (GlobalArguments == void) return false;
+    if (!has_global) return false;
     if (!std.mem.startsWith(u8, arg, "--")) return false;
 
     const struct_info = @typeInfo(OptionalStruct(GlobalArguments)).@"struct";
@@ -136,7 +192,7 @@ fn parseGlobalArgument(global_args: *OptionalStruct(GlobalArguments), arg: []con
                 if (@field(global_args, field_name) != null and !options.allow_repeats) return ParseError.DuplicateArgument;
 
                 const val = iter.next() orelse return ParseError.MissingArgumentValue;
-                @field(global_args, field_name) = try parseValue(@typeInfo(field_type).optional.child, val);
+                @field(global_args, field_name) = try parseValue(arena, @typeInfo(field_type).optional.child, val);
             }
 
             return true;
@@ -146,13 +202,13 @@ fn parseGlobalArgument(global_args: *OptionalStruct(GlobalArguments), arg: []con
     return false;
 }
 
-fn parseValue(T: type, str: [:0]const u8) ParseError!T {
+fn parseValue(arena: Allocator, T: type, str: [:0]const u8) ParseError!T {
     const type_info = @typeInfo(T);
 
     return switch (type_info) {
         .int => std.fmt.parseInt(T, str, 0) catch return ParseError.InvalidValue,
         .float => std.fmt.parseFloat(T, str) catch return ParseError.InvalidValue,
-        .pointer => str,
+        .pointer => try arena.dupe(u8, str),
         .@"enum" => |enum_info| blk: {
             for (enum_info.fields) |enum_field| {
                 if (std.mem.eql(u8, enum_field.name, str)) {
@@ -228,7 +284,7 @@ fn printHelp(gpa: Allocator, parsed: Optional(Arguments)) !void {
 
     comptime var help_str: []const u8 = "Usage: {s}{s} [OPTIONS]\n\n{s}";
 
-    if (GlobalArguments != void) {
+    if (has_global) {
         help_str = help_str ++ "Global Options:\n" ++ comptime buildStructHelp(GlobalArguments);
     }
 

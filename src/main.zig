@@ -28,7 +28,15 @@ pub const GlobalArguments = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const parsed_args, const global_args = try args.parse(init.gpa, init.minimal.args, .{});
+    const arena = init.arena.allocator();
+    const parsed_args, const global_args, const extra = try args.parse(init.gpa, arena, init.minimal.args, .{ .collect_extra_values = true });
     std.debug.print("{any}\n", .{parsed_args});
     std.debug.print("{any}\n", .{global_args});
+
+    if (extra.len != 0) {
+        std.debug.print("Extra Values:\n", .{});
+        for (extra) |ex| {
+            std.debug.print("\t{s}\n", .{ex});
+        }
+    }
 }
